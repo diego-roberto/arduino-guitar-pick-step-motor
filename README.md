@@ -13,8 +13,8 @@ O sistema aciona uma haste horizontal fixada ao eixo do motor, na extremidade da
 * **Controle de Velocidade / Frequência:** Ajuste de 10 níveis de velocidade pelas teclas `LEFT` e `RIGHT`, com cálculo instantâneo de **SPM** (*Strokes Per Minute* / Palhetadas Por Minuto).
 * **Modo de Alinhamento / Calibração (*Jog Center*):** Permite mover a haste passo a passo via botões para posicionar a palheta exatamente sobre a corda desejada antes de travar o ponto zero, **evitando forçar manualmente a caixa de engrenagens do motor**.
 * **Arquitetura 100% Não-Bloqueante:** O motor é acionado via temporização em microssegundos (`micros()`), garantindo resposta instantânea aos botões e sem travar a interface.
-* **Gerenciamento Térmico (*Coil Release*):** Ao pausar (`STOP`), todas as bobinas são desenergizadas automaticamente, impedindo que o motor de 12V aqueça enquanto oco.
-* **Acionamento em Meio-Passo (*Half-Stepping*):** Sequência de 8 fases que reduz a vibração mecânica e ruídos, essencial para um contato limpo e consistente com as cordas.
+* **Gerenciamento Térmico (*Coil Release*):** Ao pausar (`STOP`), todas as bobinas são desenergizadas automaticamente, impedindo aquecimento desnecessário.
+* **Acionamento em Meio-Passo (*Half-Stepping*):** Sequência de 8 fases que proporciona menor vibração mecânica, movimento 100% simétrico e máxima suavidade no contato com as cordas.
 
 ---
 
@@ -23,9 +23,9 @@ O sistema aciona uma haste horizontal fixada ao eixo do motor, na extremidade da
 ### Componentes Utilizados
 1. **Arduino Uno Rev3**
 2. **DFRobot LCD Keypad Shield** (Display 16x2 com teclado analógico integrado em `A0`)
-3. **Small Reduction Stepper Motor - 12VDC 32-Step** (Adafruit ID 918 / unipolar 5 fios)
-4. **Driver de Motor ULN2003** (ou módulo de transistores Darlington equivalente)
-5. **Fonte Externa de 12V DC (1A a 2A)**
+3. **Motor de Passo 28BYJ-48 5V** (Unipolar 5 fios com redução ~1:64)
+4. **Módulo Driver ULN2003**
+5. **Alimentação:** Cabo USB conectado ao computador (5V)
 
 ### Mapa de Pinos do Arduino Uno
 
@@ -36,35 +36,33 @@ O sistema aciona uma haste horizontal fixada ao eixo do motor, na extremidade da
 | **D9** | LCD Enable | Utilizado internamente pelo Shield |
 | **D10** | LCD Backlight Control | Utilizado internamente pelo Shield |
 | **A0** | Teclado Analógico (5 botões) | Divisor resistivo (Right, Up, Down, Left, Select) |
-| **D2** | **Driver ULN2003 - IN1** | Saída digital livre no Shield |
-| **D3** | **Driver ULN2003 - IN2** | Saída digital livre no Shield |
-| **D11** | **Driver ULN2003 - IN3** | Saída digital livre no Shield |
-| **D12** | **Driver ULN2003 - IN4** | Saída digital livre no Shield |
-| **GND** | **GND Comum** | Conectar ao GND do Arduino e ao (-) da Fonte 12V |
-
-> [!IMPORTANT]
-> **Atenção à Alimentação do Motor:**
-> O motor opera a **12V DC** e nunca deve ser alimentado pelo pino de 5V do Arduino. Conecte o terminal positivo (+12V) da fonte externa diretamente ao pino de alimentação do módulo ULN2003. Conecte o negativo (GND) da fonte de 12V ao **GND do Arduino** (terra comum obrigatório para referência de sinal).
+| **A1** | **Driver ULN2003 - IN1** | Saída digital livre no Shield (conector sequencial) |
+| **A2** | **Driver ULN2003 - IN2** | Saída digital livre no Shield (conector sequencial) |
+| **A3** | **Driver ULN2003 - IN3** | Saída digital livre no Shield (conector sequencial) |
+| **A4** | **Driver ULN2003 - IN4** | Saída digital livre no Shield (conector sequencial) |
+| **5V** | **Alimentação ULN2003 (+)** | Para motor 28BYJ-48 5V alimentado pela USB |
+| **GND** | **GND Comum (-)** | Conectar ao (-) do ULN2003 |
 
 ---
 
-## 3. Esquema de Ligação
+## 3. Esquema de Ligação (Alimentação USB 5V)
 
 ```
   +------------------+                    +-------------------------+
-  |  Fonte 12V DC    |--- (+12V) -------->| VCC (ou 5-12V)          |
-  |                  |--- (GND) ----------| GND         ULN2003     |
-  +------------------+       |            |                         |
-                             |            |     Conector 5 pinos    |==== [Motor 12V]
-  +------------------+       |            |     (Laranja, Amarelo,  |     (Adafruit 918)
-  |  Arduino Uno     |       |            |      Rosa, Azul, Verm)  |
-  |  + DFRobot LCD   |       |            |                         |
-  |                  |       |            | IN1  IN2   IN3   IN4    |
-  |              GND |-------+            +---|----|-----|-----|----+
-  |               D2 |------------------------+    |     |     |
-  |               D3 |-----------------------------+     |     |
-  |              D11 |-----------------------------------+     |
-  |              D12 |-----------------------------------------+
+  |  Arduino Uno     |--- (5V) ---------->| (+) 5-12V               |
+  |  + DFRobot LCD   |--- (GND) --------->| (-) GND     ULN2003     |
+  |                  |                    |                         |
+  |                  |                    |     Conector 5 pinos    |==== [Motor 28BYJ-48 5V]
+  |                  |                    |      (Azul, Rosa,       |
+  |                  |                    |    Amarelo, Laranja,    |
+  |                  |                    |        Vermelho)        |
+  |                  |                    |                         |
+  |                  |                    | IN1  IN2   IN3   IN4    |
+  |                  |                    +---|----|-----|-----|----+
+  |               A1 |------------------------+    |     |     |
+  |               A2 |-----------------------------+     |     |
+  |               A3 |-----------------------------------+     |
+  |               A4 |-----------------------------------------+
   +------------------+
 ```
 
@@ -72,25 +70,24 @@ O sistema aciona uma haste horizontal fixada ao eixo do motor, na extremidade da
 
 ## 4. Cálculos Mecânicos: Amplitude Angular e Linear
 
-O motor possui **32 passos por revolução** no rotor interno e uma caixa de redução mecânica de **~1/16** (1:16.032).
+O motor **28BYJ-48 5V** opera em modo **Meio-Passo (*Half-Stepping* de 8 Fases)** para rotação 100% suave, simétrica e sem perda de sincronismo:
 
-* **Passos completos por volta do eixo externo:** $32 \times 16 = 512\text{ passos/revolução}$
-* **Meio-passos (*Half-steps*) por volta:** $512 \times 2 = 1024\text{ meio-passos/revolução}$
+* **Meio-passos por volta completa (360°):** $4096\text{ meio-passos/revolução}$
 * **Resolução angular por meio-passo:**
-  $$\theta_{\text{passo}} = \frac{360^\circ}{1024} \approx 0.3516^\circ$$
+  $$\theta_{\text{passo}} = \frac{360^\circ}{4096} \approx 0.08789^\circ$$
 
 ### Como calcular o curso linear na ponta da palheta:
 Se a haste horizontal tiver comprimento $L$ (em milímetros, medido do centro do eixo do motor até a ponta da palheta) e a amplitude configurada for de $\pm A$ passos:
 
 1. **Ângulo total de excursão ($\Delta\theta$):**
-   $$\Delta\theta = 2 \times A \times 0.3516^\circ$$
+   $$\Delta\theta = 2 \times A \times 0.08789^\circ$$
 2. **Deslocamento linear total do arco ($\Delta s$):**
    $$\Delta s \approx L \times \left(\Delta\theta \times \frac{\pi}{180^\circ}\right)$$
 
 #### Exemplo Prático:
-Para uma haste de $L = 50\text{ mm}$ com amplitude de $A = 30\text{ passos}$ ($\pm 10.5^\circ$, curso total de $21^\circ$):
-$$\Delta s \approx 50\text{ mm} \times \left(21^\circ \times \frac{\pi}{180}\right) \approx 18.3\text{ mm}$$
-*(Ideal para palhetar amplamente uma corda ou realizar varredura de duas cordas adjacentes).*
+Para uma haste de $L = 50\text{ mm}$ com amplitude padrão de $A = 100\text{ passos}$ ($\pm 8.8^\circ$, curso total de $17.6^\circ$):
+$$\Delta s \approx 50\text{ mm} \times \left(17.6^\circ \times \frac{\pi}{180}\right) \approx 15.3\text{ mm}$$
+*(Ideal para palhetar com firmeza a corda do instrumento).*
 
 ---
 
@@ -103,8 +100,8 @@ O display LCD de 16x2 fornece leitura contínua e status do sistema:
 #### 1. Modo Normal (`[RUN]` ou `[STOP]`)
 ```
 +----------------+
-|[RUN]  V:5 180SPM| -> Linha 0: Status, Nível de Vel (1-10) e Frequência (SPM)
-|A:+-30p  10.5°  | -> Linha 1: Amplitude em passos e graus equivalentes
+|[RUN]  V:5 100SPM| -> Linha 0: Status, Nível de Vel (1-10) e Frequência (SPM)
+|A:+-100p  8.8°  | -> Linha 1: Amplitude em passos e graus equivalentes
 +----------------+
 ```
 
@@ -120,12 +117,28 @@ O display LCD de 16x2 fornece leitura contínua e status do sistema:
 
 | Botão | No Modo `RUN` | No Modo `STOP` | No Modo `AJUSTE CENTRO` |
 | :--- | :--- | :--- | :--- |
-| **SELECT** (Clique Curto) | Para o motor e volta ao centro (`STOP`) | Inicia a oscilação da palheta (`RUN`) | Salva a posição atual como o novo ponto zero e sai para `STOP` |
-| **SELECT** (Segurar 1.2s) | — | Entra no modo de **Alinhamento Manual** | Salva o novo centro e sai para `STOP` |
-| **UP** | Aumenta a amplitude (+2 passos) | Aumenta a amplitude (+2 passos) | Move a palheta 1 passo no sentido horário (CW) |
-| **DOWN** | Diminui a amplitude (-2 passos) | Diminui a amplitude (-2 passos) | Move a palheta 1 passo no sentido anti-horário (CCW) |
+| **SELECT** (Clique Curto) | Para o motor e volta ao centro (`STOP`) | Inicia a oscilação da palheta (`RUN`) | — |
+| **SELECT** (Segurar 1.5s) | — | Entra no modo de **Ajuste de Centro** | Salva o novo centro e sai para `STOP` |
+| **UP** | Aumenta a amplitude (+4 passos) | Aumenta a amplitude (+4 passos) | Avanço rápido (CW) para alinhar palheta |
+| **DOWN** | Diminui a amplitude (-4 passos) | Diminui a amplitude (-4 passos) | Avanço rápido (CCW) para alinhar palheta |
 | **RIGHT** | Aumenta velocidade (níveis 1 a 10) | Aumenta velocidade | — |
 | **LEFT** | Diminui velocidade | Diminui velocidade | — |
+
+---
+
+### Controle Alternativo via Serial (USB)
+Caso os botões físicos do shield apresentem mau contato ou oxidação, é possível operar o sistema com 100% de estabilidade pelo teclado do computador via Monitor Serial (115200 baud):
+
+| Tecla | Função |
+| :---: | :--- |
+| **`Espaço`** ou **`r`** | Alterna entre `RUN` e `STOP` |
+| **`+`** / **`-`** | Aumenta / Diminui a Amplitude de palhetada |
+| **`1`** a **`9`** | Seleciona o nível de velocidade |
+| **`a`** | Entra / Sai do modo de **Ajuste de Centro** |
+| **`u`** / **`d`** | Move para cima / baixo no alinhamento |
+| **`z`** | Salva a posição atual como o novo ponto ZERO central |
+| **`b`** | Ativa / Desativa a leitura dos botões físicos do shield (elimina interferências) |
+| **`?`** | Exibe o menu de ajuda no terminal |
 
 > [!TIP]
 > **Como alinhar a palheta na primeira montagem:**

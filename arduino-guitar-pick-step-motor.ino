@@ -4,8 +4,8 @@
   HARDWARE:
     - Arduino Uno Rev3
     - DFRobot LCD Keypad Shield (16x2 + Teclado Analógico em A0)
-    - Motor de Passo: Small Reduction Stepper Motor - 12VDC 32-Step (Adafruit 918)
-    - Driver: Módulo ULN2003 (ou ponte H equivalente para motor unipolar 5 vias)
+    - Motor de Passo: 28BYJ-48 5V (Redução ~1:64)
+    - Driver: Módulo ULN2003 alimentado em 5V
   ==============================================================================
 */
 
@@ -14,31 +14,26 @@
 // ==============================================================================
 // DEFINIÇÕES DE PINOS
 // ==============================================================================
-
-// Pinos padrão do DFRobot LCD Keypad Shield
-// RS, EN, D4, D5, D6, D7
 LiquidCrystal lcd(8, 9, 4, 5, 6, 7);
 
-const uint8_t PIN_KEYPAD     = A0; // Leitura dos botões analógicos
-const uint8_t PIN_BACKLIGHT  = 10; // Controle de brilho/ligar backlight
+const uint8_t PIN_KEYPAD     = A0; // Botões analógicos do shield
+const uint8_t PIN_BACKLIGHT  = 10; // Backlight LCD
 
-// Pinos livres no Shield DFRobot para acionamento do Driver ULN2003
-// (Conecte aos terminais IN1, IN2, IN3, IN4 da placa ULN2003)
-const uint8_t PIN_IN1        = 2;
-const uint8_t PIN_IN2        = 3;
-const uint8_t PIN_IN3        = 11;
-const uint8_t PIN_IN4        = 12;
+// Pinos de acionamento do ULN2003
+const uint8_t PIN_IN1        = A1;
+const uint8_t PIN_IN2        = A2;
+const uint8_t PIN_IN3        = A3;
+const uint8_t PIN_IN4        = A4;
 
 // ==============================================================================
-// PARÂMETROS DO MOTOR DE PASSO
-// Motor: 32 passos nativos * redução ~1/16 (exatamente 16 ou 16.032)
-// Em modo meio-passo (Half-Step / 8 fases): 32 * 16 * 2 = 1024 meio-passos / volta
+// PARÂMETROS DO MOTOR 28BYJ-48 (SEQUÊNCIA EM MEIO-PASSO / 8 FASES)
+// O 28BYJ-48 foi desenhado para meio-passo: elimina travamentos, evita engasgos
+// e garante movimento 100% simétrico nos dois sentidos com rotação perfeita.
+// 4096 meio-passos / volta de 360° (~0.08789° por meio-passo)
 // ==============================================================================
-const float STEPS_PER_REV    = 1024.0f; // Meio-passos para 360°
-const float DEG_PER_STEP     = 360.0f / STEPS_PER_REV; // ~0.3516° por meio-passo
+const float STEPS_PER_REV    = 4096.0f;
+const float DEG_PER_STEP     = 360.0f / STEPS_PER_REV;
 
-// Tabela de sequência em meio-passo (Half-stepping: 8 estados)
-// Proporciona menor vibração, maior suavidade e melhor torque para palhetar
 const uint8_t STEP_SEQ[8][4] = {
   {HIGH, LOW,  LOW,  LOW }, // 1: A
   {HIGH, HIGH, LOW,  LOW }, // 2: A+B
@@ -51,7 +46,53 @@ const uint8_t STEP_SEQ[8][4] = {
 };
 
 // ==============================================================================
-// MAPEAMENTO DOS BOTÕES DO SHIELD
+// ESTADOS DA MÁQUINA
+// ==============================================================================
+enum SystemState {
+  STATE_STOP,   // Parado no centro, bobinas desenergizadas
+  STATE_RUN,    // Strumming contínuo alternado up/down
+  STATE_ALIGN   // Ajuste/calibração rápida do centro
+};
+
+SystemState currentState = STATE_STOP;
+
+// ==============================================================================
+// VARIÁVEIS DE CONTROLE DO MOVIMENTO
+// ==============================================================================
+// Em meio-passos: 100 passos ≈ ±8.8° (curso total de ~17.6°, ideal para corda)
+int amplitudeSteps = 100;    
+int minAmplitude   = 12;     // ~1.0°
+int maxAmplitude   = 700;    // ~±61°
+
+int speedLevel     = 5;      // Nível de velocidade (1 a 10)
+const int MIN_SPEED = 1;
+const int MAX_SPEED = 10;
+
+// Delays calibrados para meio-passo suave, sem vibração e com excelente torque
+const unsigned int SPEED_DELAY_US[] = {
+  0,     // índice 0 não usado
+  2800,  // Vel 1 (Muito forte e suave, ~54 SPM)
+  2400,  // Vel 2 (~63 SPM)
+  2100,  // Vel 3 (~71 SPM)
+  1800,  // Vel 4 (~83 SPM)
+  1500,  // Vel 5 (Padrão: ~100 SPM - Strumming rítmico perfeito)
+  1350,  // Vel 6 (~111 SPM)
+  1200,  // Vel 7 (~125 SPM)
+  1050,  // Vel 8 (~143 SPM)
+  950,   // Vel 9 (~158 SPM)
+  850    // Vel 10 (~176 SPM)
+};
+
+// Posição angular atual (em meio-passos relativos ao centro zero)
+long currentStepPos = 0;
+int  motionDirection = 1;    // +1 = avançando; -1 = retornando
+uint8_t stepPhaseIndex = 0;  // 0 a 7
+
+// Base de tempo do motor
+unsigned long lastStepMicros = 0;
+
+// ==============================================================================
+// FILTRO ANTI-RUÍDO E DEBOUNCE PARA OS BOTÕES
 // ==============================================================================
 enum Button {
   BTN_NONE,
@@ -62,64 +103,36 @@ enum Button {
   BTN_SELECT
 };
 
-// ==============================================================================
-// ESTADOS DA MÁQUINA
-// ==============================================================================
-enum SystemState {
-  STATE_STOP,   // Parado no ponto zero, bobinas desenergizadas (não esquenta)
-  STATE_RUN,    // Palhetando alternadamente (-Amp <-> +Amp)
-  STATE_ALIGN   // Modo de ajuste/calibração manual do centro
-};
+bool physicalButtonsEnabled = true;
+Button stableButton = BTN_NONE;
+Button lastCandidateButton = BTN_NONE;
+unsigned long candidateStartTime = 0;
+unsigned long buttonPressStartTime = 0;
+unsigned long lastRepeatTime = 0;
+bool selectLongPressHandled = false;
 
-SystemState currentState = STATE_STOP;
+// Leitura com filtro de múltiplas amostras (elimina ruído induzido pelo motor)
+Button getFilteredButton() {
+  if (!physicalButtonsEnabled) return BTN_NONE;
 
-// ==============================================================================
-// VARIÁVEIS DE CONTROLE DO MOVIMENTO
-// ==============================================================================
-int amplitudeSteps = 30;     // Amplitude em meio-passos (±30 passos ≈ ±10.5°, curso total de 21°)
-int minAmplitude   = 4;      // Mínimo de passos
-int maxAmplitude   = 200;    // Máximo de passos (±70°)
+  int a0 = 0;
+  for (int i = 0; i < 4; i++) {
+    a0 += analogRead(PIN_KEYPAD);
+  }
+  a0 /= 4;
 
-int speedLevel     = 5;      // Nível de velocidade (1 a 10)
-const int MIN_SPEED = 1;
-const int MAX_SPEED = 10;
-
-// Mapeamento de velocidade (1 = lento / 6000µs por passo; 10 = rápido / 1500µs por passo)
-const unsigned int SPEED_DELAY_US[] = {
-  0,     // índice 0 não usado
-  6000,  // Vel 1 (Muito suave)
-  5000,  // Vel 2
-  4200,  // Vel 3
-  3500,  // Vel 4
-  2800,  // Vel 5 (Padrão)
-  2300,  // Vel 6
-  1900,  // Vel 7
-  1600,  // Vel 8
-  1400,  // Vel 9
-  1200   // Vel 10 (Máxima velocidade segura a 12V)
-};
-
-// Posição angular atual (em passos relativos ao centro 0)
-long currentStepPos = 0;
-int  motionDirection = 1;    // +1 = avançando para +Amp; -1 = voltando para -Amp
-uint8_t stepPhaseIndex = 0;  // Índice na tabela de sequência (0 a 7)
-
-// Temporizadores (não bloqueantes)
-unsigned long lastStepMicros = 0;
-unsigned long lastLcdUpdate   = 0;
-const unsigned long LCD_REFRESH_INTERVAL_MS = 120; // Atualiza LCD a cada 120ms sem travar o motor
-
-// Detecção e debounce de botões
-Button lastDetectedBtn = BTN_NONE;
-unsigned long btnPressStartTime = 0;
-unsigned long lastBtnRepeatTime = 0;
-bool selectHandledLongPress = false;
+  if (a0 > 920) return BTN_NONE;
+  if (a0 < 70)  return BTN_RIGHT;
+  if (a0 < 240) return BTN_UP;
+  if (a0 < 420) return BTN_DOWN;
+  if (a0 < 630) return BTN_LEFT;
+  if (a0 < 860) return BTN_SELECT;
+  return BTN_NONE;
+}
 
 // ==============================================================================
-// FUNÇÕES DE ACIONAMENTO DO MOTOR
+// ACIONAMENTO DO MOTOR
 // ==============================================================================
-
-// Aplica a fase correspondente nos pinos do motor
 void applyStepPhase(uint8_t phase) {
   digitalWrite(PIN_IN1, STEP_SEQ[phase][0]);
   digitalWrite(PIN_IN2, STEP_SEQ[phase][1]);
@@ -127,7 +140,6 @@ void applyStepPhase(uint8_t phase) {
   digitalWrite(PIN_IN4, STEP_SEQ[phase][3]);
 }
 
-// Desliga todas as bobinas do motor para economizar energia e evitar aquecimento
 void releaseMotor() {
   digitalWrite(PIN_IN1, LOW);
   digitalWrite(PIN_IN2, LOW);
@@ -135,19 +147,17 @@ void releaseMotor() {
   digitalWrite(PIN_IN4, LOW);
 }
 
-// Executa um único meio-passo na direção indicada (+1 ou -1)
 void stepMotor(int dir) {
   if (dir > 0) {
     stepPhaseIndex = (stepPhaseIndex + 1) % 8;
     currentStepPos++;
   } else if (dir < 0) {
-    stepPhaseIndex = (stepPhaseIndex + 7) % 8; // Equivalente a -1 com wrap-around
+    stepPhaseIndex = (stepPhaseIndex + 7) % 8;
     currentStepPos--;
   }
   applyStepPhase(stepPhaseIndex);
 }
 
-// Move suavemente de volta ao centro zero
 void returnToCenter() {
   while (currentStepPos != 0) {
     int dir = (currentStepPos > 0) ? -1 : 1;
@@ -158,37 +168,14 @@ void returnToCenter() {
 }
 
 // ==============================================================================
-// LEITURA E DEBOUNCE DO TECLADO ANALÓGICO
+// ATUALIZAÇÃO DO DISPLAY LCD
+// Chamada APENAS sob demanda para não engasgar o motor durante o RUN
 // ==============================================================================
-Button readKeypadRaw() {
-  int adcVal = analogRead(PIN_KEYPAD);
-  // Faixas típicas do divisor de tensão do DFRobot Keypad Shield
-  if (adcVal > 850) return BTN_NONE;
-  if (adcVal < 60)  return BTN_RIGHT;
-  if (adcVal < 220) return BTN_UP;
-  if (adcVal < 395) return BTN_DOWN;
-  if (adcVal < 600) return BTN_LEFT;
-  if (adcVal < 820) return BTN_SELECT;
-  return BTN_NONE;
-}
-
-// ==============================================================================
-// ATUALIZAÇÃO DO DISPLAY LCD (16x2)
-// ==============================================================================
-void updateDisplay(bool force = false) {
-  unsigned long now = millis();
-  if (!force && (now - lastLcdUpdate < LCD_REFRESH_INTERVAL_MS)) {
-    return;
-  }
-  lastLcdUpdate = now;
-
-  // Cálculo da frequência aproximada em Palhetadas Por Minuto (SPM - Strokes Per Minute)
-  // Cada ciclo completo (ida e volta) possui 4 * amplitudeSteps meio-passos
+void updateDisplay() {
   unsigned long delayUs = SPEED_DELAY_US[speedLevel];
   float cycleSeconds = (4.0f * (float)amplitudeSteps * (float)delayUs) / 1000000.0f;
   int spm = (cycleSeconds > 0) ? (int)(60.0f / cycleSeconds) : 0;
 
-  // Cálculo da amplitude em graus (conversão para inteiro e decimal sem depender de %f no AVR)
   int degX10 = (int)(amplitudeSteps * DEG_PER_STEP * 10.0f + 0.5f);
   int degInt = degX10 / 10;
   int degDec = degX10 % 10;
@@ -198,30 +185,23 @@ void updateDisplay(bool force = false) {
 
   switch (currentState) {
     case STATE_RUN:
-      // Linha 0: [RUN] V:5 180SPM
       snprintf(line0, sizeof(line0), "[RUN] V:%-2d %3dSPM", speedLevel, spm);
-      // Linha 1: A:+-30p  10.5°
       snprintf(line1, sizeof(line1), "A:+-%-3dp %2d.%1d%c", amplitudeSteps, degInt, degDec, 0xDF);
       break;
 
     case STATE_STOP:
-      // Linha 0: [STOP] V:5 180SPM
       snprintf(line0, sizeof(line0), "[STOP] V:%-2d%3dSPM", speedLevel, spm);
-      // Linha 1: A:+-30p  10.5°
       snprintf(line1, sizeof(line1), "A:+-%-3dp %2d.%1d%c", amplitudeSteps, degInt, degDec, 0xDF);
       break;
 
     case STATE_ALIGN:
-      // Modo de alinhamento fino manual da palheta sobre a corda
       snprintf(line0, sizeof(line0), "[AJUSTE CENTRO] ");
       snprintf(line1, sizeof(line1), "Pos:%+4ld  UP/DWN", currentStepPos);
       break;
   }
 
-  // Escreve diretamente sem limpar tela inteira (evita flickering e atraso)
   lcd.setCursor(0, 0);
   lcd.print(line0);
-  // Garante preenchimento de 16 caracteres
   for (int i = strlen(line0); i < 16; i++) lcd.print(' ');
 
   lcd.setCursor(0, 1);
@@ -230,103 +210,225 @@ void updateDisplay(bool force = false) {
 }
 
 // ==============================================================================
-// PROCESSAMENTO DE ENTRADAS DO USUÁRIO
+// TRATAMENTO DOS BOTÕES FÍSICOS
 // ==============================================================================
-void handleKeypad() {
-  Button currentBtn = readKeypadRaw();
+void handleButtonAction(Button btn) {
+  if (currentState == STATE_ALIGN) {
+    int dir = (btn == BTN_UP) ? 1 : (btn == BTN_DOWN ? -1 : 0);
+    if (dir != 0) {
+      // Salto inicial ágil de 16 meio-passos (~1.4°)
+      for (int i = 0; i < 16; i++) {
+        stepMotor(dir);
+        delayMicroseconds(1600);
+      }
+      updateDisplay();
+    }
+    return;
+  }
+
+  // Ajuste de Amplitude
+  if (btn == BTN_UP) {
+    if (amplitudeSteps < maxAmplitude) amplitudeSteps += 8;
+    updateDisplay();
+  } else if (btn == BTN_DOWN) {
+    if (amplitudeSteps > minAmplitude) amplitudeSteps -= 8;
+    updateDisplay();
+  }
+
+  // Ajuste de Velocidade
+  if (btn == BTN_RIGHT) {
+    if (speedLevel < MAX_SPEED) speedLevel++;
+    updateDisplay();
+  } else if (btn == BTN_LEFT) {
+    if (speedLevel > MIN_SPEED) speedLevel--;
+    updateDisplay();
+  }
+}
+
+void processPhysicalButtons() {
+  Button rawBtn = getFilteredButton();
   unsigned long now = millis();
 
-  // Reset se nenhum botão pressionado
-  if (currentBtn == BTN_NONE) {
-    if (lastDetectedBtn == BTN_SELECT && !selectHandledLongPress) {
-      // Clique curto no SELECT: Alterna entre RUN e STOP
-      if (currentState == STATE_RUN) {
-        currentState = STATE_STOP;
-        returnToCenter();
-      } else if (currentState == STATE_STOP) {
-        currentState = STATE_RUN;
-        motionDirection = 1;
+  if (rawBtn != lastCandidateButton) {
+    lastCandidateButton = rawBtn;
+    candidateStartTime = now;
+    return;
+  }
+
+  if (now - candidateStartTime < 70) {
+    return;
+  }
+
+  if (rawBtn != stableButton) {
+    Button previousStable = stableButton;
+    stableButton = rawBtn;
+    buttonPressStartTime = now;
+    lastRepeatTime = now;
+    selectLongPressHandled = false;
+
+    if (stableButton == BTN_NONE) {
+      if (previousStable == BTN_SELECT && !selectLongPressHandled) {
+        if (currentState == STATE_RUN) {
+          currentState = STATE_STOP;
+          Serial.println(F("[COMANDO] Estado -> STOP"));
+          returnToCenter();
+        } else if (currentState == STATE_STOP) {
+          currentState = STATE_RUN;
+          motionDirection = 1;
+          Serial.println(F("[COMANDO] Estado -> RUN"));
+        }
+        updateDisplay();
       }
-      updateDisplay(true);
+      return;
     }
-    lastDetectedBtn = BTN_NONE;
-    selectHandledLongPress = false;
-    btnPressStartTime = 0;
+
+    handleButtonAction(stableButton);
     return;
   }
 
-  // Novo botão detectado
-  if (currentBtn != lastDetectedBtn) {
-    lastDetectedBtn = currentBtn;
-    btnPressStartTime = now;
-    lastBtnRepeatTime = now;
-    selectHandledLongPress = false;
-
-    // Dispara ação no primeiro clique imediato (exceto SELECT, que tem verificação de clique longo)
-    if (currentBtn != BTN_SELECT) {
-      executeButtonAction(currentBtn);
-      updateDisplay(true);
-    }
-    return;
-  }
-
-  // Botão continuou sendo pressionado: Trata clique longo do SELECT para entrar no modo ALIGN
-  if (currentBtn == BTN_SELECT && !selectHandledLongPress) {
-    if (now - btnPressStartTime >= 1200) { // Segurou SELECT por 1.2 segundos
-      selectHandledLongPress = true;
-      if (currentState == STATE_STOP) {
-        currentState = STATE_ALIGN;
-        currentStepPos = 0; // Ponto de partida do alinhamento
-      } else if (currentState == STATE_ALIGN) {
-        // Confirma a posição atual como o novo ZERO
-        currentStepPos = 0;
-        currentState = STATE_STOP;
-        releaseMotor();
+  if (stableButton != BTN_NONE) {
+    if (stableButton == BTN_SELECT && !selectLongPressHandled) {
+      if (now - buttonPressStartTime >= 1500) {
+        selectLongPressHandled = true;
+        if (currentState == STATE_STOP) {
+          currentState = STATE_ALIGN;
+          currentStepPos = 0;
+          Serial.println(F("[COMANDO] Modo AJUSTE CENTRO ativado"));
+        } else if (currentState == STATE_ALIGN) {
+          currentStepPos = 0;
+          currentState = STATE_STOP;
+          releaseMotor();
+          Serial.println(F("[COMANDO] Novo centro zero calibrado!"));
+        }
+        updateDisplay();
       }
-      updateDisplay(true);
+      return;
     }
-    return;
-  }
 
-  // Repetição automática ao segurar botões de ajuste (UP, DOWN, LEFT, RIGHT)
-  if (currentBtn != BTN_SELECT) {
-    if (now - btnPressStartTime > 400 && now - lastBtnRepeatTime > 90) {
-      lastBtnRepeatTime = now;
-      executeButtonAction(currentBtn);
-      updateDisplay(true);
+    if (stableButton != BTN_SELECT) {
+      if (currentState == STATE_ALIGN) {
+        if (now - buttonPressStartTime > 200) {
+          int dir = (stableButton == BTN_UP) ? 1 : (stableButton == BTN_DOWN ? -1 : 0);
+          if (dir != 0) {
+            stepMotor(dir);
+            delayMicroseconds(1600);
+            static unsigned long lastAlignLcd = 0;
+            if (now - lastAlignLcd > 100) {
+              lastAlignLcd = now;
+              updateDisplay();
+            }
+          }
+        }
+      } else {
+        if (now - buttonPressStartTime > 400 && now - lastRepeatTime > 80) {
+          lastRepeatTime = now;
+          handleButtonAction(stableButton);
+        }
+      }
     }
   }
 }
 
-// Executa a ação do botão de acordo com o estado do sistema
-void executeButtonAction(Button btn) {
-  if (currentState == STATE_ALIGN) {
-    // No modo de alinhamento: UP move no sentido horário, DOWN move no anti-horário
-    if (btn == BTN_UP) {
-      stepMotor(1);
-    } else if (btn == BTN_DOWN) {
-      stepMotor(-1);
-    }
-    return;
-  }
+// ==============================================================================
+// CONTROLE VIA SERIAL (USB)
+// ==============================================================================
+void processSerialCommands() {
+  while (Serial.available() > 0) {
+    char c = Serial.read();
+    if (c == '\r' || c == '\n') continue;
 
-  // Nos modos STOP e RUN:
-  // UP / DOWN: Ajusta amplitude do curso de palhetada
-  if (btn == BTN_UP) {
-    if (amplitudeSteps < maxAmplitude) {
-      amplitudeSteps += 2; // Incrementa de 2 em 2 meio-passos (~0.7°)
-    }
-  } else if (btn == BTN_DOWN) {
-    if (amplitudeSteps > minAmplitude) {
-      amplitudeSteps -= 2;
-    }
-  }
+    switch (c) {
+      case ' ':
+      case 'r':
+      case 'R':
+        if (currentState == STATE_RUN) {
+          currentState = STATE_STOP;
+          Serial.println(F("[SERIAL] STOP"));
+          returnToCenter();
+        } else {
+          currentState = STATE_RUN;
+          motionDirection = 1;
+          Serial.println(F("[SERIAL] RUN"));
+        }
+        updateDisplay();
+        break;
 
-  // RIGHT / LEFT: Ajusta nível de velocidade
-  if (btn == BTN_RIGHT) {
-    if (speedLevel < MAX_SPEED) speedLevel++;
-  } else if (btn == BTN_LEFT) {
-    if (speedLevel > MIN_SPEED) speedLevel--;
+      case '+':
+      case '=':
+        if (amplitudeSteps < maxAmplitude) amplitudeSteps += 8;
+        Serial.print(F("[SERIAL] Amplitude: ")); Serial.println(amplitudeSteps);
+        updateDisplay();
+        break;
+
+      case '-':
+      case '_':
+        if (amplitudeSteps > minAmplitude) amplitudeSteps -= 8;
+        Serial.print(F("[SERIAL] Amplitude: ")); Serial.println(amplitudeSteps);
+        updateDisplay();
+        break;
+
+      case '1': case '2': case '3': case '4': case '5':
+      case '6': case '7': case '8': case '9':
+        speedLevel = c - '0';
+        Serial.print(F("[SERIAL] Velocidade: ")); Serial.println(speedLevel);
+        updateDisplay();
+        break;
+
+      case 'a':
+      case 'A':
+        if (currentState != STATE_ALIGN) {
+          currentState = STATE_ALIGN;
+          currentStepPos = 0;
+          Serial.println(F("[SERIAL] Modo ALINHAMENTO. Teclas 'u' / 'd' movem, 'z' salva!"));
+        } else {
+          currentState = STATE_STOP;
+          releaseMotor();
+          Serial.println(F("[SERIAL] Saiu do alinhamento"));
+        }
+        updateDisplay();
+        break;
+
+      case 'u':
+      case 'U':
+        if (currentState == STATE_ALIGN) {
+          for (int i = 0; i < 32; i++) { stepMotor(1); delayMicroseconds(1600); }
+          Serial.print(F("[SERIAL] Posicao: ")); Serial.println(currentStepPos);
+          updateDisplay();
+        }
+        break;
+
+      case 'd':
+      case 'D':
+        if (currentState == STATE_ALIGN) {
+          for (int i = 0; i < 32; i++) { stepMotor(-1); delayMicroseconds(1600); }
+          Serial.print(F("[SERIAL] Posicao: ")); Serial.println(currentStepPos);
+          updateDisplay();
+        }
+        break;
+
+      case 'z':
+      case 'Z':
+        if (currentState == STATE_ALIGN) {
+          currentStepPos = 0;
+          currentState = STATE_STOP;
+          releaseMotor();
+          Serial.println(F("[SERIAL] CENTRO ZERO SALVO!"));
+          updateDisplay();
+        }
+        break;
+
+      case 'b':
+      case 'B':
+        physicalButtonsEnabled = !physicalButtonsEnabled;
+        Serial.print(F("[SERIAL] Botoes fisicos: "));
+        Serial.println(physicalButtonsEnabled ? F("ATIVADOS") : F("DESATIVADOS"));
+        break;
+
+      case '?':
+      case 'h':
+        Serial.println(F("\nCOMANDOS: [r] Run/Stop | [+] [-] Amplitude | [1-9] Velocidade | [a] Alinhar | [u]/[d] Mover | [z] Salvar Zero | [b] Ligar/Desligar Botoes"));
+        break;
+    }
   }
 }
 
@@ -334,37 +436,43 @@ void executeButtonAction(Button btn) {
 // SETUP
 // ==============================================================================
 void setup() {
-  // Configuração dos pinos do motor como saída
+  Serial.begin(115200);
+  Serial.println(F("\n=================================================="));
+  Serial.println(F("   PALHETADOR AUTOMATICO DE GUITARRA COM ARDUINO  "));
+  Serial.println(F("=================================================="));
+  Serial.println(F("Sistema pronto em modo STOP."));
+  Serial.println(F("Pressione SELECT ou envie 'r' para iniciar."));
+
   pinMode(PIN_IN1, OUTPUT);
   pinMode(PIN_IN2, OUTPUT);
   pinMode(PIN_IN3, OUTPUT);
   pinMode(PIN_IN4, OUTPUT);
   releaseMotor();
 
-  // Configuração do Backlight do shield
   pinMode(PIN_BACKLIGHT, OUTPUT);
   digitalWrite(PIN_BACKLIGHT, HIGH);
 
-  // Inicialização do LCD
   lcd.begin(16, 2);
-  lcd.clear();
-  lcd.print("Palhetador v1.0");
+  lcd.print("Palhetador v3.1");
   lcd.setCursor(0, 1);
-  lcd.print("Iniciando...");
-  delay(1200);
+  lcd.print("Pronto (STOP)...");
+  delay(1000);
 
   lcd.clear();
-  updateDisplay(true);
+  updateDisplay();
 }
 
 // ==============================================================================
-// LOOP PRINCIPAL (100% NÃO-BLOQUEANTE)
+// LOOP PRINCIPAL (100% SUAVE E SIMÉTRICO)
 // ==============================================================================
 void loop() {
-  // 1. Processa botões e interface
-  handleKeypad();
+  // 1. Processa botões físicos com filtro pesado
+  processPhysicalButtons();
 
-  // 2. Controle do movimento da palheta
+  // 2. Processa comandos Serial (USB)
+  processSerialCommands();
+
+  // 3. Movimento de palhetada alternada contínua (Strumming Up/Down)
   if (currentState == STATE_RUN) {
     unsigned long nowMicros = micros();
     unsigned long stepInterval = SPEED_DELAY_US[speedLevel];
@@ -372,10 +480,10 @@ void loop() {
     if (nowMicros - lastStepMicros >= stepInterval) {
       lastStepMicros = nowMicros;
 
-      // Executa um meio-passo na direção atual
+      // Executa o meio-passo
       stepMotor(motionDirection);
 
-      // Inversão de direção nos limites de amplitude (Palhetada alternada)
+      // Inversão perfeitamente simétrica nos limites de amplitude
       if (currentStepPos >= amplitudeSteps) {
         motionDirection = -1;
       } else if (currentStepPos <= -amplitudeSteps) {
@@ -383,7 +491,4 @@ void loop() {
       }
     }
   }
-
-  // 3. Atualiza periodicamente o display LCD
-  updateDisplay(false);
 }
